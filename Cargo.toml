@@ -1,0 +1,30 @@
+[package]
+name = "mosh-client"
+version = "0.1.0"
+edition = "2021"
+description = "A native Windows Mosh (mobile shell) client in Rust"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+russh = "0.46"
+russh-keys = "0.46"
+aes = "0.8"
+ocb3 = "0.1"
+aead = { version = "0.5", features = ["std"] }
+prost = "0.13"
+prost-derive = "0.13"
+crossterm = "0.28"
+vte = "0.13"
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+rand = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
