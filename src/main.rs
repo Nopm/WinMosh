@@ -220,9 +220,8 @@ async fn run_session(
             notification.clear();
         }
         if let Some(reason) = transport.remote_close_reason() {
-            notification.set_message(&format!("mosh: {}", reason));
-            let _ = notification.render(latest_remote_fb.width, latest_remote_fb.height);
-            eprintln!("mosh: {}", reason);
+            let _ = renderer::Renderer::cleanup();
+            eprintln!("\nmosh: {}", reason);
             return Ok(());
         }
         predictor.set_local_frame_acked(transport.acked_state_num());
@@ -368,11 +367,9 @@ async fn run_session(
                 overlay_fb.cursor_col = pc;
             }
 
-            // Render the frame
-            render.render(&overlay_fb)?;
+            notification.apply(&mut overlay_fb);
 
-            // Render notification bar if visible
-            notification.render(overlay_fb.width, overlay_fb.height)?;
+            render.render(&overlay_fb)?;
 
             last_render = std::time::Instant::now();
         }

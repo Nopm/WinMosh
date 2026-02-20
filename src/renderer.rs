@@ -245,29 +245,28 @@ impl Renderer {
         Ok(())
     }
 
-    /// Initialize the terminal for raw mode rendering.
     pub fn init() -> io::Result<()> {
         terminal::enable_raw_mode()?;
         execute!(
             io::stdout(),
+            terminal::EnterAlternateScreen,
             cursor::Show,
         )?;
         Ok(())
     }
 
-    /// Restore the terminal to its original state.
     pub fn cleanup() -> io::Result<()> {
         execute!(
             io::stdout(),
             style::ResetColor,
             cursor::Show,
+            terminal::LeaveAlternateScreen,
         )?;
         terminal::disable_raw_mode()?;
         Ok(())
     }
 }
 
-/// Notification overlay bar shown at the bottom of the screen.
 pub struct NotificationBar {
     message: String,
     visible: bool,
@@ -291,45 +290,27 @@ impl NotificationBar {
         self.visible = false;
     }
 
-    /// Render the notification bar at the bottom of the screen.
-    pub fn render(&self, width: usize, height: usize) -> io::Result<()> {
-        if !self.visible || height == 0 {
-            return Ok(());
+    pub fn apply(&self, fb: &mut Framebuffer) {
+        if !self.visible || fb.height == 0 || fb.width == 0 {
+            return;
         }
 
-        let mut stdout = io::stdout();
-        let bar_row = (height - 1) as u16;
-
-        queue!(
-            stdout,
-            cursor::MoveTo(0, bar_row),
-            SetBackgroundColor(style::Color::DarkBlue),
-            SetForegroundColor(style::Color::White),
-            SetAttribute(Attribute::Bold),
-        )?;
-
-        // Pad or truncate message to fit width
-        let display_msg = if self.message.len() > width {
-            &self.message[..width]
-        } else {
-            &self.message
-        };
-
-        queue!(stdout, style::Print(display_msg))?;
-
-        // Fill remaining space
-        let padding = width.saturating_sub(display_msg.len());
-        if padding > 0 {
-            queue!(stdout, style::Print(" ".repeat(padding)))?;
+        if fb.cursor_row == 0 {
+            fb.cursor_visible = false;
         }
 
-        queue!(
-            stdout,
-            style::ResetColor,
-            SetAttribute(Attribute::Reset),
-        )?;
+        let msg_chars: Vec<char> = self.message.chars().take(fb.width).collect();
 
-        stdout.flush()?;
-        Ok(())
+        for col in 0..fb.width {
+            let cell = &mut fb.cells[0][col];
+            cell.fg = Color::Indexed(7);
+            cell.bg = Color::Indexed(4);
+            cell.attrs = Attributes { bold: true, ..Attributes::default() };
+            cell.character = if col < msg_chars.len() {
+                msg_chars[col]
+            } else {
+                ' '
+            };
+        }
     }
 }
