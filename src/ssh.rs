@@ -476,11 +476,7 @@ async fn try_ssh_agent(
             return try_agent_auth(session, username, agent).await;
         }
         Err(e) => {
-            eprintln!(
-                "SSH: Windows OpenSSH agent not available ({})\n  \
-                 Hint: start it with: Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent",
-                e
-            );
+            log::debug!("SSH: Windows OpenSSH agent not available ({})", e);
         }
     }
 
