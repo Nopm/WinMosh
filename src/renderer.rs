@@ -7,6 +7,7 @@
 use crate::terminal::{Attributes, Cell, Color, Framebuffer};
 use crossterm::{
     cursor,
+    event::{DisableBracketedPaste, EnableBracketedPaste},
     execute, queue,
     style::{self, Attribute, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{self, ClearType},
@@ -86,9 +87,7 @@ impl Renderer {
         // Hide cursor during rendering to avoid flicker
         queue!(stdout, cursor::Hide)?;
 
-        let full_redraw = self.force_redraw
-            || fb.width != self.width
-            || fb.height != self.height;
+        let full_redraw = self.force_redraw || fb.width != self.width || fb.height != self.height;
 
         if full_redraw {
             // Full redraw
@@ -109,7 +108,13 @@ impl Renderer {
                 queue!(stdout, cursor::MoveTo(0, row as u16))?;
                 for col in 0..fb.width {
                     let cell = &fb.cells[row][col];
-                    self.emit_cell(&mut stdout, cell, &mut last_fg, &mut last_bg, &mut last_attrs)?;
+                    self.emit_cell(
+                        &mut stdout,
+                        cell,
+                        &mut last_fg,
+                        &mut last_bg,
+                        &mut last_attrs,
+                    )?;
                 }
             }
 
@@ -139,7 +144,13 @@ impl Renderer {
                             queue!(stdout, cursor::MoveTo(col as u16, row as u16))?;
                         }
 
-                        self.emit_cell(&mut stdout, cell, &mut last_fg, &mut last_bg, &mut last_attrs)?;
+                        self.emit_cell(
+                            &mut stdout,
+                            cell,
+                            &mut last_fg,
+                            &mut last_bg,
+                            &mut last_attrs,
+                        )?;
 
                         last_row = Some(row);
                         last_col = col + 1;
@@ -160,10 +171,7 @@ impl Renderer {
         let cursor_row = fb.cursor_row.min(fb.height.saturating_sub(1));
         let cursor_col = fb.cursor_col.min(fb.width.saturating_sub(1));
 
-        queue!(
-            stdout,
-            cursor::MoveTo(cursor_col as u16, cursor_row as u16)
-        )?;
+        queue!(stdout, cursor::MoveTo(cursor_col as u16, cursor_row as u16))?;
 
         if fb.cursor_visible {
             queue!(stdout, cursor::Show)?;
@@ -249,6 +257,7 @@ impl Renderer {
         terminal::enable_raw_mode()?;
         execute!(
             io::stdout(),
+            EnableBracketedPaste,
             terminal::EnterAlternateScreen,
             cursor::Show,
         )?;
@@ -260,6 +269,7 @@ impl Renderer {
             io::stdout(),
             style::ResetColor,
             cursor::Show,
+            DisableBracketedPaste,
             terminal::LeaveAlternateScreen,
         )?;
         terminal::disable_raw_mode()?;
@@ -305,7 +315,10 @@ impl NotificationBar {
             let cell = &mut fb.cells[0][col];
             cell.fg = Color::Indexed(7);
             cell.bg = Color::Indexed(4);
-            cell.attrs = Attributes { bold: true, ..Attributes::default() };
+            cell.attrs = Attributes {
+                bold: true,
+                ..Attributes::default()
+            };
             cell.character = if col < msg_chars.len() {
                 msg_chars[col]
             } else {

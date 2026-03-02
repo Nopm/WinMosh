@@ -393,8 +393,11 @@ fn handle_key_event(event: &KeyEvent) -> Option<Vec<u8>> {
 
     let code = event.code;
     let modifiers = event.modifiers;
+    let altgr_like = modifiers.contains(KeyModifiers::CONTROL)
+        && modifiers.contains(KeyModifiers::ALT)
+        && matches!(code, KeyCode::Char(_));
 
-    if modifiers.contains(KeyModifiers::CONTROL) {
+    if modifiers.contains(KeyModifiers::CONTROL) && !altgr_like {
         if let KeyCode::Char(c) = code {
             if c.is_ascii() {
                 if let Some(ctrl) = encode_ctrl_char(c as u8) {
@@ -449,7 +452,7 @@ fn handle_key_event(event: &KeyEvent) -> Option<Vec<u8>> {
         _ => return None,
     };
 
-    if modifiers.contains(KeyModifiers::ALT) && !matches!(code, KeyCode::Esc) {
+    if modifiers.contains(KeyModifiers::ALT) && !altgr_like && !matches!(code, KeyCode::Esc) {
         out.insert(0, 0x1B);
     }
 
@@ -524,6 +527,16 @@ mod tests {
     fn test_alt_prefixes_escape() {
         let alt_x = key(KeyCode::Char('x'), KeyModifiers::ALT, KeyEventKind::Press);
         assert!(matches!(handle_key_event(&alt_x), Some(v) if v == b"\x1Bx"));
+    }
+
+    #[test]
+    fn test_ctrl_alt_char_is_treated_as_altgr_literal() {
+        let altgr_slash = key(
+            KeyCode::Char('/'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyEventKind::Press,
+        );
+        assert!(matches!(handle_key_event(&altgr_slash), Some(v) if v == b"/"));
     }
 
     #[test]
