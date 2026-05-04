@@ -565,6 +565,8 @@ fn encode_sgr_mouse(
         }
         MouseEventKind::ScrollDown => (64 | mod_mask, 'M'),
         MouseEventKind::ScrollUp => (65 | mod_mask, 'M'),
+        MouseEventKind::ScrollLeft => (66 | mod_mask, 'M'),
+        MouseEventKind::ScrollRight => (67 | mod_mask, 'M'),
     };
 
     let cx = event.column.saturating_add(1);
