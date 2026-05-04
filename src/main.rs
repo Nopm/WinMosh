@@ -563,8 +563,8 @@ fn encode_sgr_mouse(
             }
             (35, 'm') // 32 + 3 (no button)
         }
-        MouseEventKind::ScrollDown => (64 | mod_mask, 'M'),
-        MouseEventKind::ScrollUp => (65 | mod_mask, 'M'),
+        MouseEventKind::ScrollDown => (65 | mod_mask, 'M'),
+        MouseEventKind::ScrollUp => (64 | mod_mask, 'M'),
         MouseEventKind::ScrollLeft => (66 | mod_mask, 'M'),
         MouseEventKind::ScrollRight => (67 | mod_mask, 'M'),
     };
