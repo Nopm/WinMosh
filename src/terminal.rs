@@ -69,6 +69,25 @@ impl Default for CursorStyle {
     }
 }
 
+/// Mouse reporting mode set by the server via DECSET/DECRST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseMode {
+    /// No mouse reporting.
+    None,
+    /// DECSET ?1000 — report button press and release.
+    NormalTracking,
+    /// DECSET ?1002 — report press, release, and drag (motion with button held).
+    ButtonEventTracking,
+    /// DECSET ?1003 — report all mouse motion.
+    AnyEventTracking,
+}
+
+impl Default for MouseMode {
+    fn default() -> Self {
+        MouseMode::None
+    }
+}
+
 /// The terminal framebuffer: a 2D grid of cells plus cursor state.
 #[derive(Clone)]
 pub struct Framebuffer {
@@ -102,6 +121,10 @@ pub struct Framebuffer {
     tab_stops: Vec<bool>,
     /// Window title.
     pub title: String,
+    /// Current mouse reporting mode (set by DECSET/DECRST ?1000/1002/1003).
+    pub mouse_mode: MouseMode,
+    /// Whether SGR extended mouse encoding is enabled (DECSET ?1006).
+    pub sgr_mouse: bool,
 }
 
 impl Framebuffer {
@@ -134,6 +157,8 @@ impl Framebuffer {
             wrap_pending: false,
             tab_stops,
             title: String::new(),
+            mouse_mode: MouseMode::None,
+            sgr_mouse: false,
         }
     }
 
@@ -867,6 +892,18 @@ impl<'a> vte::Perform for VtPerformer<'a> {
                             self.fb.move_col(0, false, false);
                             self.fb.origin_mode = true;
                         }
+                        1000 => {
+                            if matches!(self.fb.mouse_mode, MouseMode::None) {
+                                self.fb.mouse_mode = MouseMode::NormalTracking;
+                            }
+                        }
+                        1002 => {
+                            self.fb.mouse_mode = MouseMode::ButtonEventTracking;
+                        }
+                        1003 => {
+                            self.fb.mouse_mode = MouseMode::AnyEventTracking;
+                        }
+                        1006 => self.fb.sgr_mouse = true,
                         _ => {}
                     }
                 }
@@ -890,6 +927,22 @@ impl<'a> vte::Perform for VtPerformer<'a> {
                             self.fb.move_col(0, false, false);
                             self.fb.origin_mode = false;
                         }
+                        1000 => {
+                            if matches!(self.fb.mouse_mode, MouseMode::NormalTracking) {
+                                self.fb.mouse_mode = MouseMode::None;
+                            }
+                        }
+                        1002 => {
+                            if matches!(self.fb.mouse_mode, MouseMode::ButtonEventTracking) {
+                                self.fb.mouse_mode = MouseMode::None;
+                            }
+                        }
+                        1003 => {
+                            if matches!(self.fb.mouse_mode, MouseMode::AnyEventTracking) {
+                                self.fb.mouse_mode = MouseMode::None;
+                            }
+                        }
+                        1006 => self.fb.sgr_mouse = false,
                         _ => {}
                     }
                 }

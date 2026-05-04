@@ -20,7 +20,11 @@ mod userstream;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use crossterm::execute;
 use prediction::PredictionMode;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -199,6 +203,9 @@ async fn run_session(
     // Initialize prediction engine
     let mut predictor = prediction::PredictionEngine::new(predict_mode, width, height);
 
+    // Mouse capture state (toggled based on remote framebuffer DECSET/DECRST).
+    let mut mouse_capture_enabled = false;
+
     // Send initial resize to server
     transport.push_resize(width as i32, height as i32);
 
@@ -224,6 +231,28 @@ async fn run_session(
             eprintln!("\nmosh: {}", reason);
             return Ok(());
         }
+
+        // Toggle mouse capture based on remote framebuffer mode.
+        {
+            let want_capture =
+                latest_remote_fb.mouse_mode != terminal::MouseMode::None
+                    && latest_remote_fb.sgr_mouse;
+            if want_capture != mouse_capture_enabled {
+                if want_capture {
+                    let _ = execute!(
+                        std::io::stdout(),
+                        crossterm::event::EnableMouseCapture
+                    );
+                } else {
+                    let _ = execute!(
+                        std::io::stdout(),
+                        crossterm::event::DisableMouseCapture
+                    );
+                }
+                mouse_capture_enabled = want_capture;
+            }
+        }
+
         predictor.set_local_frame_acked(transport.acked_state_num());
         predictor.set_send_interval(transport.send_interval_ms());
         predictor.set_local_frame_late_acked(transport.latest_remote_echo_ack());
@@ -327,6 +356,27 @@ async fn run_session(
                     if !data.is_empty() {
                         transport.push_user_input(&data);
                         predictor.new_user_input_batch(&data, &local_framebuffer);
+                    }
+                }
+                Event::Mouse(mouse_event) => {
+                    if transport.shutdown_in_progress() {
+                        continue;
+                    }
+                    if command_pending {
+                        command_pending = false;
+                        notification.set_message("mosh: command canceled");
+                    }
+                    predictor.set_local_frame_sent(transport.sent_state_last_num());
+
+                    let mouse_mode = latest_remote_fb.mouse_mode;
+                    let sgr = latest_remote_fb.sgr_mouse;
+                    if sgr {
+                        if let Some(data) =
+                            encode_sgr_mouse(&mouse_event, mouse_mode, mouse_event.modifiers)
+                        {
+                            transport.push_user_input(&data);
+                            predictor.new_user_input_batch(&data, &local_framebuffer);
+                        }
                     }
                 }
                 Event::Resize(new_w, new_h) => {
@@ -483,6 +533,65 @@ fn encode_ctrl_char(c: u8) -> Option<u8> {
         b'7' | b'_' => Some(0x1F),
         b'8' | b'?' => Some(0x7F),
         _ => None,
+    }
+}
+
+/// Encode a mouse event into the SGR extended VT escape sequence (DECSET ?1006).
+///
+/// Format: `\x1b[<Cb;Cx;Cy;M` (press/scroll) or `\x1b[<Cb;Cx;Cy;m` (release/drag).
+/// Coordinates are 1-based per the VT protocol.
+fn encode_sgr_mouse(
+    event: &MouseEvent,
+    mode: terminal::MouseMode,
+    modifiers: KeyModifiers,
+) -> Option<Vec<u8>> {
+    let mod_mask = modifier_mask(modifiers);
+
+    let (cb, final_char) = match event.kind {
+        MouseEventKind::Down(button) => {
+            let b = mouse_button_code(button);
+            (b | mod_mask, 'M')
+        }
+        MouseEventKind::Up(_) => (3 | mod_mask, 'm'),
+        MouseEventKind::Drag(button) => {
+            let b = mouse_button_code(button);
+            (32 | b | mod_mask, 'm')
+        }
+        MouseEventKind::Moved => {
+            if !matches!(mode, terminal::MouseMode::AnyEventTracking) {
+                return None;
+            }
+            (35, 'm') // 32 + 3 (no button)
+        }
+        MouseEventKind::ScrollDown => (64 | mod_mask, 'M'),
+        MouseEventKind::ScrollUp => (65 | mod_mask, 'M'),
+    };
+
+    let cx = event.column.saturating_add(1);
+    let cy = event.row.saturating_add(1);
+
+    Some(format!("\x1b[<{};{};{}{}", cb, cx, cy, final_char).into_bytes())
+}
+
+fn modifier_mask(mods: KeyModifiers) -> u8 {
+    let mut mask = 0u8;
+    if mods.contains(KeyModifiers::SHIFT) {
+        mask |= 4;
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        mask |= 8;
+    }
+    if mods.contains(KeyModifiers::CONTROL) {
+        mask |= 16;
+    }
+    mask
+}
+
+fn mouse_button_code(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
     }
 }
 
