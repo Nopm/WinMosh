@@ -552,16 +552,19 @@ fn encode_sgr_mouse(
             let b = mouse_button_code(button);
             (b | mod_mask, 'M')
         }
-        MouseEventKind::Up(_) => (3 | mod_mask, 'm'),
+        MouseEventKind::Up(button) => {
+            let b = mouse_button_code(button);
+            (b | mod_mask, 'm')
+        }
         MouseEventKind::Drag(button) => {
             let b = mouse_button_code(button);
-            (32 | b | mod_mask, 'm')
+            (32 | b | mod_mask, 'M')
         }
         MouseEventKind::Moved => {
             if !matches!(mode, terminal::MouseMode::AnyEventTracking) {
                 return None;
             }
-            (35, 'm') // 32 + 3 (no button)
+            (35 | mod_mask, 'M') // 32 + 3 (no button)
         }
         MouseEventKind::ScrollDown => (65 | mod_mask, 'M'),
         MouseEventKind::ScrollUp => (64 | mod_mask, 'M'),
@@ -638,6 +641,43 @@ mod tests {
     fn test_alt_prefixes_escape() {
         let alt_x = key(KeyCode::Char('x'), KeyModifiers::ALT, KeyEventKind::Press);
         assert!(matches!(handle_key_event(&alt_x), Some(v) if v == b"\x1Bx"));
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16, modifiers: KeyModifiers) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn test_sgr_mouse_release_preserves_button_code() {
+        let event = mouse(MouseEventKind::Up(MouseButton::Left), 4, 2, KeyModifiers::NONE);
+        let encoded = encode_sgr_mouse(&event, terminal::MouseMode::NormalTracking, event.modifiers);
+        assert_eq!(encoded, Some(b"\x1b[<0;5;3m".to_vec()));
+    }
+
+    #[test]
+    fn test_sgr_mouse_drag_uses_press_final() {
+        let event = mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            4,
+            2,
+            KeyModifiers::SHIFT,
+        );
+        let encoded =
+            encode_sgr_mouse(&event, terminal::MouseMode::ButtonEventTracking, event.modifiers);
+        assert_eq!(encoded, Some(b"\x1b[<36;5;3M".to_vec()));
+    }
+
+    #[test]
+    fn test_sgr_mouse_motion_includes_modifiers() {
+        let event = mouse(MouseEventKind::Moved, 1, 0, KeyModifiers::CONTROL);
+        let encoded =
+            encode_sgr_mouse(&event, terminal::MouseMode::AnyEventTracking, event.modifiers);
+        assert_eq!(encoded, Some(b"\x1b[<51;2;1M".to_vec()));
     }
 
     #[test]
