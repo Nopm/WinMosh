@@ -375,7 +375,10 @@ async fn run_session(
                     };
                     if let Some(data) = data {
                         transport.push_user_input(&data);
-                        predictor.new_user_input_batch(&data, &local_framebuffer);
+                        // Mouse escape sequences are not keyboard echo — don't
+                        // feed them to the prediction engine. The legacy protocol's
+                        // payload bytes (value+32) fall in the printable ASCII range
+                        // and would create spurious character overlays on screen.
                     }
                 }
                 Event::Resize(new_w, new_h) => {
