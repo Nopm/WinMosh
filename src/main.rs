@@ -234,9 +234,7 @@ async fn run_session(
 
         // Toggle mouse capture based on remote framebuffer mode.
         {
-            let want_capture =
-                latest_remote_fb.mouse_mode != terminal::MouseMode::None
-                    && latest_remote_fb.sgr_mouse;
+            let want_capture = latest_remote_fb.mouse_mode != terminal::MouseMode::None;
             if want_capture != mouse_capture_enabled {
                 if want_capture {
                     let _ = execute!(
@@ -370,13 +368,14 @@ async fn run_session(
 
                     let mouse_mode = latest_remote_fb.mouse_mode;
                     let sgr = latest_remote_fb.sgr_mouse;
-                    if sgr {
-                        if let Some(data) =
-                            encode_sgr_mouse(&mouse_event, mouse_mode, mouse_event.modifiers)
-                        {
-                            transport.push_user_input(&data);
-                            predictor.new_user_input_batch(&data, &local_framebuffer);
-                        }
+                    let data = if sgr {
+                        encode_sgr_mouse(&mouse_event, mouse_mode, mouse_event.modifiers)
+                    } else {
+                        encode_normal_mouse(&mouse_event, mouse_mode, mouse_event.modifiers)
+                    };
+                    if let Some(data) = data {
+                        transport.push_user_input(&data);
+                        predictor.new_user_input_batch(&data, &local_framebuffer);
                     }
                 }
                 Event::Resize(new_w, new_h) => {
@@ -538,7 +537,7 @@ fn encode_ctrl_char(c: u8) -> Option<u8> {
 
 /// Encode a mouse event into the SGR extended VT escape sequence (DECSET ?1006).
 ///
-/// Format: `\x1b[<Cb;Cx;Cy;M` (press/scroll) or `\x1b[<Cb;Cx;Cy;m` (release/drag).
+/// Format: `\x1b[<Cb;Cx;Cy;M` (press/drag/scroll/motion) or `\x1b[<Cb;Cx;Cy;m` (release).
 /// Coordinates are 1-based per the VT protocol.
 fn encode_sgr_mouse(
     event: &MouseEvent,
@@ -576,6 +575,55 @@ fn encode_sgr_mouse(
     let cy = event.row.saturating_add(1);
 
     Some(format!("\x1b[<{};{};{}{}", cb, cx, cy, final_char).into_bytes())
+}
+
+/// Encode a mouse event using the legacy X10/VT200-style mouse protocol.
+///
+/// Format: `\x1b[M Cb Cx Cy`, where each payload byte is value + 32.
+/// Coordinates are 1-based and capped to the protocol's encodable range.
+fn encode_normal_mouse(
+    event: &MouseEvent,
+    mode: terminal::MouseMode,
+    modifiers: KeyModifiers,
+) -> Option<Vec<u8>> {
+    let mod_mask = modifier_mask(modifiers);
+
+    let cb = match event.kind {
+        MouseEventKind::Down(button) => mouse_button_code(button) | mod_mask,
+        MouseEventKind::Up(_) => 3 | mod_mask,
+        MouseEventKind::Drag(button) => {
+            if !matches!(
+                mode,
+                terminal::MouseMode::ButtonEventTracking | terminal::MouseMode::AnyEventTracking
+            ) {
+                return None;
+            }
+            32 | mouse_button_code(button) | mod_mask
+        }
+        MouseEventKind::Moved => {
+            if !matches!(mode, terminal::MouseMode::AnyEventTracking) {
+                return None;
+            }
+            35 | mod_mask
+        }
+        MouseEventKind::ScrollUp => 64 | mod_mask,
+        MouseEventKind::ScrollDown => 65 | mod_mask,
+        MouseEventKind::ScrollLeft => 66 | mod_mask,
+        MouseEventKind::ScrollRight => 67 | mod_mask,
+    };
+
+    // Legacy mouse protocol sends coordinates as single bytes offset by 32.
+    let cx = mouse_coordinate_byte(event.column)?;
+    let cy = mouse_coordinate_byte(event.row)?;
+    let cb = cb.checked_add(32)?;
+
+    Some(vec![0x1B, b'[', b'M', cb, cx, cy])
+}
+
+fn mouse_coordinate_byte(coord: u16) -> Option<u8> {
+    let value = coord.checked_add(1)?;
+    let value = value.checked_add(32)?;
+    u8::try_from(value).ok()
 }
 
 fn modifier_mask(mods: KeyModifiers) -> u8 {
@@ -678,6 +726,35 @@ mod tests {
         let encoded =
             encode_sgr_mouse(&event, terminal::MouseMode::AnyEventTracking, event.modifiers);
         assert_eq!(encoded, Some(b"\x1b[<51;2;1M".to_vec()));
+    }
+
+    #[test]
+    fn test_normal_mouse_press_without_sgr() {
+        let event = mouse(MouseEventKind::Down(MouseButton::Left), 4, 2, KeyModifiers::NONE);
+        let encoded =
+            encode_normal_mouse(&event, terminal::MouseMode::NormalTracking, event.modifiers);
+        assert_eq!(encoded, Some(vec![0x1B, b'[', b'M', 32, 37, 35]));
+    }
+
+    #[test]
+    fn test_normal_mouse_release_without_sgr() {
+        let event = mouse(MouseEventKind::Up(MouseButton::Left), 4, 2, KeyModifiers::SHIFT);
+        let encoded =
+            encode_normal_mouse(&event, terminal::MouseMode::NormalTracking, event.modifiers);
+        assert_eq!(encoded, Some(vec![0x1B, b'[', b'M', 39, 37, 35]));
+    }
+
+    #[test]
+    fn test_normal_mouse_motion_requires_any_event_tracking() {
+        let event = mouse(MouseEventKind::Moved, 1, 0, KeyModifiers::CONTROL);
+        assert_eq!(
+            encode_normal_mouse(&event, terminal::MouseMode::NormalTracking, event.modifiers),
+            None
+        );
+        assert_eq!(
+            encode_normal_mouse(&event, terminal::MouseMode::AnyEventTracking, event.modifiers),
+            Some(vec![0x1B, b'[', b'M', 83, 34, 33])
+        );
     }
 
     #[test]
