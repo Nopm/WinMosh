@@ -8,7 +8,8 @@
 
 use crate::crypto::{self, Base64Key, Direction, Session};
 use crate::network::{
-    current_timestamp, Fragment, FragmentAssembly, Fragmenter, Packet, MAX_FRAG_PAYLOAD,
+    current_timestamp, max_frag_payload_for_family, timestamp_diff, Fragment, FragmentAssembly,
+    Fragmenter, Packet,
 };
 use crate::terminal::{Framebuffer, Terminal};
 use crate::userstream::UserStream;
@@ -38,11 +39,20 @@ const RECEIVED_QUEUE_LIMIT: usize = 1024;
 const RECEIVER_QUENCH_MS: u64 = 15_000;
 const CHAFF_MAX_LEN: usize = 16;
 
-// ── RTT estimator constants ────────────────────────────────────────────────
+// ── Client roaming constants (1:1 with mosh network.h) ─────────────────────
+const PORT_HOP_INTERVAL: u64 = 10_000;       // ms without roundtrip success before hopping
+const MAX_PORTS_OPEN: usize = 10;
+const MAX_OLD_SOCKET_AGE: u64 = 60_000;      // ms
+
+// ── RTT estimator constants (1:1 with mosh network.cc) ─────────────────────
 const RTO_MIN_MS: u64 = 50;
 const RTO_MAX_MS: u64 = 1000;
 const SRTT_ALPHA: f64 = 0.125;
 const RTTVAR_BETA: f64 = 0.25;
+/// Ignore RTT samples at least this large (e.g. server was Ctrl-Zed).
+const RTT_SAMPLE_MAX_MS: f64 = 5000.0;
+/// Only echo a received timestamp if we've held it for less than this long.
+const TIMESTAMP_ECHO_FRESHNESS_MS: u64 = 1000;
 
 // ── Protobuf message types (defined inline, no protoc needed) ──────────────
 
@@ -223,9 +233,11 @@ struct RttEstimator {
 
 impl RttEstimator {
     fn new() -> Self {
+        // Mosh assumes a slow link until the first measurement:
+        // Connection() : ... SRTT( 1000 ), RTTVAR( 500 ) ...
         Self {
-            srtt: 100.0,
-            rttvar: 50.0,
+            srtt: 1000.0,
+            rttvar: 500.0,
             has_sample: false,
         }
     }
@@ -243,8 +255,9 @@ impl RttEstimator {
     }
 
     /// Retransmission timeout in milliseconds.
+    /// Mosh: `RTO = lrint( ceil( SRTT + 4 * RTTVAR ) )`, clamped.
     fn rto_ms(&self) -> u64 {
-        let rto = (self.srtt + 4.0 * self.rttvar) as u64;
+        let rto = (self.srtt + 4.0 * self.rttvar).ceil() as u64;
         rto.clamp(RTO_MIN_MS, RTO_MAX_MS)
     }
 }
@@ -261,11 +274,31 @@ impl RttEstimator {
 /// - `assumed_receiver_state`: index into sent_states — optimistic guess of receiver's state
 /// - Diff is computed as `current_state.diff_from(assumed_state)` — never overlaps
 pub struct Transport {
-    // ── Network ──────────────────────────────────────────────────────
+    // ── Network (1:1 with mosh Connection) ────────────────────────
     session: Session,
-    socket: UdpSocket,
+    /// Open sockets; back = newest (mosh keeps old sockets open for
+    /// receiving after a port hop, pruned by `prune_sockets`).
+    socks: Vec<UdpSocket>,
+    remote_addr: SocketAddr,
     direction: Direction,
     next_seq: u64,
+    /// Replay guard: highest in-order sequence number seen + 1
+    /// (mosh `expected_receiver_seq`; security-sensitive).
+    expected_receiver_seq: u64,
+    /// Most recently received peer timestamp, echoed back at most once
+    /// (mosh `saved_timestamp` / `saved_timestamp_received_at`).
+    saved_timestamp: Option<u16>,
+    saved_timestamp_received_at: Instant,
+    /// When we last opened a new socket (mosh `last_port_choice`).
+    last_port_choice: Instant,
+    /// Timestamp of the last sent state known to have been acknowledged
+    /// (mosh `last_roundtrip_success`; drives client port hopping).
+    last_roundtrip_success: Instant,
+    /// Per-family maximum fragment payload (mosh derives it from get_MTU()).
+    max_frag_payload: usize,
+    /// Most recent non-fatal socket error, surfaced like mosh's network
+    /// error notification (upstream never terminates on socket errors).
+    socket_error: Option<String>,
     fragmenter: Fragmenter,
     assembly: FragmentAssembly,
     rtt: RttEstimator,
@@ -302,12 +335,6 @@ pub struct Transport {
     receiver_quench_until: Option<Instant>,
     /// True when newest remote state advanced.
     remote_state_changed: bool,
-    /// Last timestamp received (for timestamp_reply echo).
-    last_recv_timestamp: u16,
-    /// Last time we received any packet.
-    last_recv_time: Instant,
-    /// Remote session closure status (e.g., ICMP port unreachable after logout).
-    remote_closed: Option<String>,
 }
 
 impl Transport {
@@ -333,8 +360,18 @@ impl Transport {
         };
 
         Ok(Self {
-            session, socket, direction,
+            session,
+            socks: vec![socket],
+            remote_addr,
+            direction,
             next_seq: 0,
+            expected_receiver_seq: 0,
+            saved_timestamp: None,
+            saved_timestamp_received_at: now,
+            last_port_choice: now,
+            last_roundtrip_success: now,
+            max_frag_payload: max_frag_payload_for_family(remote_addr.is_ipv6()),
+            socket_error: None,
             fragmenter: Fragmenter::new(),
             assembly: FragmentAssembly::new(),
             rtt: RttEstimator::new(),
@@ -354,17 +391,32 @@ impl Transport {
             received_states: vec![initial_remote],
             receiver_quench_until: None,
             remote_state_changed: false,
-            last_recv_timestamp: u16::MAX,
-            last_recv_time: now,
-            remote_closed: None,
         })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.socket.local_addr().context("Failed to get local addr")
+        self.socks
+            .last()
+            .expect("at least one socket is always open")
+            .local_addr()
+            .context("Failed to get local addr")
     }
 
-    pub fn time_since_last_recv(&self) -> Duration { self.last_recv_time.elapsed() }
+    /// Age of the latest accepted remote state — 1:1 with what mosh's client
+    /// feeds the notification engine (`get_latest_remote_state().timestamp`).
+    pub fn latest_remote_state_age(&self) -> Duration {
+        self.received_states
+            .last()
+            .expect("received_states always contains initial state")
+            .timestamp
+            .elapsed()
+    }
+
+    /// Age of the last sent state known to be acknowledged — 1:1 with mosh's
+    /// `get_sent_state_acked_timestamp()` fed to `server_acked()`.
+    pub fn sent_state_acked_age(&self) -> Duration {
+        self.sent_states[0].timestamp.elapsed()
+    }
 
     /// In mosh, this checks if the remote address is known.
     /// We always know it (from SSH bootstrap + socket connect), so always true.
@@ -372,14 +424,16 @@ impl Transport {
         true
     }
 
-    /// Whether we've received at least one packet from the server.
+    /// Whether we've received at least one remote state — mosh's
+    /// `still_connecting()` is `get_remote_state_num() == 0`.
     pub fn has_received_data(&self) -> bool {
         self.received_states.last().map(|s| s.num).unwrap_or(0) > 0
-            || self.last_recv_timestamp != u16::MAX
     }
 
-    pub fn remote_close_reason(&self) -> Option<&str> {
-        self.remote_closed.as_deref()
+    /// Most recent non-fatal socket error, if any (mosh surfaces these in the
+    /// notification bar and keeps the session alive).
+    pub fn take_socket_error(&mut self) -> Option<String> {
+        self.socket_error.take()
     }
 
     pub fn start_shutdown(&mut self) {
@@ -642,7 +696,7 @@ impl Transport {
 
         let encoded = instruction.encode_to_vec();
         let compressed = zlib_compress(&encoded)?;
-        let fragments = self.fragmenter.make_fragments(&compressed, MAX_FRAG_PAYLOAD);
+        let fragments = self.fragmenter.make_fragments(&compressed, self.max_frag_payload);
         for frag in fragments {
             self.send_packet(&frag.to_bytes()).await?;
         }
@@ -652,10 +706,6 @@ impl Transport {
 
     // ── tick (1:1 with mosh) ───────────────────────────────────────
     pub async fn tick(&mut self) -> Result<()> {
-        if self.remote_closed.is_some() {
-            return Ok(());
-        }
-
         self.calculate_timers();
 
         if !self.has_remote_addr() {
@@ -713,61 +763,136 @@ impl Transport {
         let seq = self.next_seq;
         self.next_seq += 1;
         let nonce = crypto::make_nonce(self.direction, seq);
+
+        // Mosh Connection::new_packet(): if we have a recently received
+        // timestamp, echo it "corrected" by how long we held it — and only
+        // once (saved_timestamp is consumed).
+        let mut timestamp_reply = u16::MAX;
+        if let Some(saved) = self.saved_timestamp {
+            let held = self.saved_timestamp_received_at.elapsed();
+            if held < Duration::from_millis(TIMESTAMP_ECHO_FRESHNESS_MS) {
+                timestamp_reply = saved.wrapping_add(held.as_millis() as u16);
+                self.saved_timestamp = None;
+            }
+        }
+
         let pkt = Packet {
             timestamp: current_timestamp(),
-            timestamp_reply: self.last_recv_timestamp,
+            timestamp_reply,
             payload: payload.to_vec(),
         };
         let encrypted = self.session.encrypt(&nonce, &pkt.to_bytes())?;
-        if let Err(e) = self.socket.send(&encrypted).await {
-            if is_remote_close_error(&e) {
-                self.mark_remote_closed(e);
-                return Ok(());
+        let sock = self.socks.last().expect("at least one socket is always open");
+        if let Err(e) = sock.send(&encrypted).await {
+            if is_transient_socket_error(&e) {
+                self.note_socket_error(&e);
+            } else {
+                return Err(e.into());
             }
-            return Err(e.into());
         }
+
+        // Mosh Connection::send(): the client hops to a new source port when
+        // there has been no roundtrip success for PORT_HOP_INTERVAL.
+        let now = Instant::now();
+        if now.duration_since(self.last_port_choice) > Duration::from_millis(PORT_HOP_INTERVAL)
+            && now.duration_since(self.last_roundtrip_success)
+                > Duration::from_millis(PORT_HOP_INTERVAL)
+        {
+            self.hop_port().await?;
+        }
+
         Ok(())
+    }
+
+    /// Mosh Connection::hop_port(): open a fresh local port; keep old
+    /// sockets around for receiving until pruned.
+    async fn hop_port(&mut self) -> Result<()> {
+        self.last_port_choice = Instant::now();
+        let bind_addr = if self.remote_addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let socket = UdpSocket::bind(bind_addr)
+            .await
+            .context("Failed to bind UDP socket for port hop")?;
+        socket
+            .connect(self.remote_addr)
+            .await
+            .context("Failed to connect hopped UDP socket")?;
+        log::info!("hopped to new local port {:?}", socket.local_addr().ok());
+        self.socks.push(socket);
+        self.prune_sockets();
+        Ok(())
+    }
+
+    /// Mosh Connection::prune_sockets().
+    fn prune_sockets(&mut self) {
+        // Don't keep old sockets if the new socket has been working long enough.
+        if self.socks.len() > 1 {
+            if self.last_port_choice.elapsed() > Duration::from_millis(MAX_OLD_SOCKET_AGE) {
+                let num_to_kill = self.socks.len() - 1;
+                self.socks.drain(..num_to_kill);
+            }
+        } else {
+            return;
+        }
+
+        // Make sure we don't have too many receive sockets open.
+        if self.socks.len() > MAX_PORTS_OPEN {
+            let num_to_kill = self.socks.len() - MAX_PORTS_OPEN;
+            self.socks.drain(..num_to_kill);
+        }
     }
 
     pub async fn readable(&self) -> Result<()> {
-        self.socket.readable().await.context("socket readable failed")?;
+        // Old (pre-hop) sockets are drained opportunistically by the main
+        // loop's periodic wakeup; block on the newest socket only.
+        self.socks
+            .last()
+            .expect("at least one socket is always open")
+            .readable()
+            .await
+            .context("socket readable failed")?;
         Ok(())
     }
 
-    /// Drain all currently readable UDP datagrams.
+    /// Drain all currently readable UDP datagrams from every open socket.
+    ///
+    /// Datagram-level failures (undecryptable, malformed, wrong direction)
+    /// are logged and dropped — mosh treats them as non-fatal (dos_assert /
+    /// CryptoException are caught in the client main loop), so one bad
+    /// packet must never kill the session.
     pub fn drain_recv(&mut self) -> Result<()> {
         let mut buf = [0u8; 2048];
+        let mut received_any = false;
 
-        loop {
-            let n = match self.socket.try_recv(&mut buf) {
-                Ok(n) => n,
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) if is_remote_close_error(&e) => {
-                    self.mark_remote_closed(e);
-                    break;
+        let mut idx = 0;
+        while idx < self.socks.len() {
+            match self.socks[idx].try_recv(&mut buf) {
+                Ok(n) => {
+                    received_any = true;
+                    if let Err(e) = self.process_datagram(&buf[..n]) {
+                        log::warn!("dropping datagram: {:#}", e);
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => idx += 1,
+                Err(e) if is_transient_socket_error(&e) => {
+                    // e.g. ICMP port unreachable surfaced as ECONNRESET on a
+                    // connected UDP socket. Mosh reports and keeps trying.
+                    self.note_socket_error(&e);
+                    idx += 1;
                 }
                 Err(e) => return Err(e.into()),
-            };
-
-            self.process_datagram(&buf[..n])?;
+            }
         }
 
+        if received_any {
+            self.prune_sockets();
+        }
         Ok(())
     }
 
-    fn mark_remote_closed(&mut self, err: std::io::Error) {
-        if self.remote_closed.is_none() {
-            let graceful = self.shutdown_in_progress || self.ack_num == u64::MAX;
-            if graceful {
-                self.remote_closed = Some("server closed the session".to_string());
-            } else {
-                self.remote_closed = Some(format!(
-                    "remote host closed session ({})",
-                    err
-                ));
-            }
-            log::info!("{}", self.remote_closed.as_ref().unwrap());
-        }
+    fn note_socket_error(&mut self, err: &std::io::Error) {
+        let msg = format!("Network error: {}", err);
+        log::info!("{}", msg);
+        self.socket_error = Some(msg);
     }
 
     fn process_throwaway_until(&mut self, throwaway_num: u64) -> Result<()> {
@@ -783,24 +908,43 @@ impl Transport {
 
     fn process_datagram(&mut self, datagram: &[u8]) -> Result<()> {
         let (nonce, plaintext) = self.session.decrypt(datagram)?;
-        let _ = crypto::parse_nonce(&{
-            let mut w = [0u8; 8]; w.copy_from_slice(&nonce[4..12]); w
-        });
+        let wire_nonce = {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&nonce[4..12]);
+            w
+        };
+        let (packet_direction, seq) = crypto::parse_nonce(&wire_nonce);
+
+        // Mosh: dos_assert( p.direction == (server ? TO_SERVER : TO_CLIENT) )
+        // — prevent malicious playback to sender.
+        let expected_direction = match self.direction {
+            Direction::ToServer => Direction::ToClient,
+            Direction::ToClient => Direction::ToServer,
+        };
+        if packet_direction != expected_direction {
+            anyhow::bail!("packet has wrong direction bit (possible reflection)");
+        }
 
         let packet = Packet::from_bytes(&plaintext)?;
-        self.last_recv_time = Instant::now();
-        self.last_recv_timestamp = packet.timestamp;
-        self.last_heard = Instant::now();
 
-        // RTT from timestamp echo
-        if packet.timestamp_reply != u16::MAX {
-            let now_ts = current_timestamp();
-            let rtt_ms = if now_ts >= packet.timestamp_reply {
-                (now_ts - packet.timestamp_reply) as f64
-            } else {
-                (65536 + now_ts as u32 - packet.timestamp_reply as u32) as f64
-            };
-            if rtt_ms < 10000.0 { self.rtt.update(rtt_ms); }
+        // Mosh: don't use (but do process) out-of-order packets for
+        // timestamps. Security-sensitive: a replay attack could otherwise
+        // screw up the timestamp state.
+        if seq >= self.expected_receiver_seq {
+            self.expected_receiver_seq = seq + 1;
+
+            if packet.timestamp != u16::MAX {
+                self.saved_timestamp = Some(packet.timestamp);
+                self.saved_timestamp_received_at = Instant::now();
+            }
+
+            if packet.timestamp_reply != u16::MAX {
+                let rtt_ms = f64::from(timestamp_diff(current_timestamp(), packet.timestamp_reply));
+                // Mosh: ignore large values, e.g. server was Ctrl-Zed.
+                if rtt_ms < RTT_SAMPLE_MAX_MS {
+                    self.rtt.update(rtt_ms);
+                }
+            }
         }
 
         if packet.payload.is_empty() {
@@ -827,6 +971,11 @@ impl Transport {
             // Process ack (mosh: process_acknowledgment_through + set_ack_num)
             let ack = ti.ack_num.unwrap_or_default();
             self.process_acknowledgment_through(ack);
+
+            // Mosh: inform network layer of roundtrip (end-to-end-to-end)
+            // connectivity — connection.set_last_roundtrip_success(
+            //   sender.get_sent_state_acked_timestamp() ).
+            self.last_roundtrip_success = self.sent_states[0].timestamp;
 
             let new_num = ti.new_num.unwrap_or_default();
 
@@ -867,6 +1016,7 @@ impl Transport {
             let mut new_state = reference_state;
             new_state.timestamp = Instant::now();
             new_state.num = new_num;
+            let accept_time = new_state.timestamp;
 
             let diff = ti.diff.unwrap_or_default();
             let had_diff = !diff.is_empty();
@@ -902,6 +1052,10 @@ impl Transport {
 
             let latest_num = self.received_states.last().map(|s| s.num).unwrap_or(0);
             self.ack_num = latest_num;
+            // Mosh: sender.remote_heard( new_state.timestamp ) — last_heard
+            // advances only when a new in-order state is accepted, not on
+            // every datagram.
+            self.last_heard = accept_time;
             if had_diff {
                 self.pending_data_ack = true;
             }
@@ -957,7 +1111,10 @@ fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>> {
     Ok(decompressed)
 }
 
-fn is_remote_close_error(err: &std::io::Error) -> bool {
+/// Socket errors mosh treats as transient network conditions (e.g. ICMP
+/// port unreachable reported on a connected UDP socket). Upstream surfaces
+/// them as NetworkException in the client loop and keeps the session alive.
+fn is_transient_socket_error(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
         std::io::ErrorKind::ConnectionReset
@@ -1224,8 +1381,118 @@ mod tests {
     }
 
     #[test]
-    fn connection_reset_is_treated_as_remote_close() {
+    fn connection_reset_is_transient_not_fatal() {
+        // Mosh never terminates a session on socket errors (e.g. ICMP port
+        // unreachable) — it surfaces them and keeps trying.
         let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
-        assert!(is_remote_close_error(&err));
+        assert!(is_transient_socket_error(&err));
+    }
+
+    #[test]
+    fn initial_rtt_matches_upstream() {
+        // Mosh Connection(): SRTT( 1000 ), RTTVAR( 500 ).
+        let rtt = RttEstimator::new();
+        assert_eq!(rtt.srtt, 1000.0);
+        assert_eq!(rtt.rttvar, 500.0);
+        assert_eq!(rtt.rto_ms(), RTO_MAX_MS);
+    }
+
+    #[tokio::test]
+    async fn initial_send_interval_is_max_frame_interval() {
+        // ceil(1000 / 2) = 500, clamped to SEND_INTERVAL_MAX (250).
+        let (transport, _peer, _key) = test_transport().await;
+        assert_eq!(transport.send_interval_ms(), SEND_INTERVAL_MAX);
+    }
+
+    #[tokio::test]
+    async fn rejects_packets_with_wrong_direction_bit() {
+        // Mosh: dos_assert( p.direction == TO_CLIENT ) on the client —
+        // prevent malicious playback (reflection) to sender.
+        let (mut transport, _peer, key) = test_transport().await;
+        let session = Session::new(&key).unwrap();
+        let pkt = Packet {
+            timestamp: 1,
+            timestamp_reply: u16::MAX,
+            payload: Vec::new(),
+        };
+        let reflected = session
+            .encrypt(&make_nonce(Direction::ToServer, 0), &pkt.to_bytes())
+            .unwrap();
+        assert!(transport.process_datagram(&reflected).is_err());
+    }
+
+    #[tokio::test]
+    async fn replayed_packets_do_not_update_timestamp_state() {
+        let (mut transport, _peer, key) = test_transport().await;
+        let session = Session::new(&key).unwrap();
+
+        let pkt = Packet {
+            timestamp: 100,
+            timestamp_reply: u16::MAX,
+            payload: Vec::new(),
+        };
+        let dgram = session
+            .encrypt(&make_nonce(Direction::ToClient, 5), &pkt.to_bytes())
+            .unwrap();
+        transport.process_datagram(&dgram).unwrap();
+        assert_eq!(transport.expected_receiver_seq, 6);
+        assert_eq!(transport.saved_timestamp, Some(100));
+
+        // Replay an older sequence number: accepted for payload, but must
+        // not touch the timestamp state.
+        let stale = Packet {
+            timestamp: 999,
+            timestamp_reply: u16::MAX,
+            payload: Vec::new(),
+        };
+        let stale_dgram = session
+            .encrypt(&make_nonce(Direction::ToClient, 3), &stale.to_bytes())
+            .unwrap();
+        transport.process_datagram(&stale_dgram).unwrap();
+        assert_eq!(transport.expected_receiver_seq, 6);
+        assert_eq!(transport.saved_timestamp, Some(100));
+    }
+
+    #[tokio::test]
+    async fn timestamp_echo_is_corrected_and_single_use() {
+        let (mut transport, peer, key) = test_transport().await;
+        let session = Session::new(&key).unwrap();
+
+        let pkt = Packet {
+            timestamp: 4242,
+            timestamp_reply: u16::MAX,
+            payload: Vec::new(),
+        };
+        let dgram = session
+            .encrypt(&make_nonce(Direction::ToClient, 0), &pkt.to_bytes())
+            .unwrap();
+        transport.process_datagram(&dgram).unwrap();
+
+        // First outgoing packet echoes the saved timestamp, advanced by the
+        // hold time (mosh's "corrected" timestamp).
+        transport.send_packet(b"x").await.unwrap();
+        let mut buf = [0u8; 2048];
+        let n = peer.recv(&mut buf).await.unwrap();
+        let (_, plain) = session.decrypt(&buf[..n]).unwrap();
+        let sent = Packet::from_bytes(&plain).unwrap();
+        assert_ne!(sent.timestamp_reply, u16::MAX);
+        assert!(crate::network::timestamp_diff(sent.timestamp_reply, 4242) < 1000);
+
+        // The echo is consumed: the next packet carries no timestamp reply.
+        transport.send_packet(b"y").await.unwrap();
+        let n = peer.recv(&mut buf).await.unwrap();
+        let (_, plain) = session.decrypt(&buf[..n]).unwrap();
+        let sent = Packet::from_bytes(&plain).unwrap();
+        assert_eq!(sent.timestamp_reply, u16::MAX);
+    }
+
+    #[tokio::test]
+    async fn corrupt_datagrams_do_not_kill_the_session() {
+        let (mut transport, peer, _key) = test_transport().await;
+        let local = transport.local_addr().unwrap();
+        peer.send_to(b"garbage garbage garbage", local).await.unwrap();
+        // Give the datagram time to arrive, then drain: must not error.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        transport.drain_recv().unwrap();
     }
 }

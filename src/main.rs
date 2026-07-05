@@ -53,7 +53,7 @@ struct Cli {
     #[arg(long, default_value = "mosh-server")]
     server: String,
 
-    /// Prediction mode: always, adaptive, never.
+    /// Prediction mode: adaptive, always, never, experimental.
     #[arg(long, default_value = "adaptive")]
     predict: String,
 
@@ -81,11 +81,16 @@ async fn main() -> Result<()> {
         .format_timestamp_millis()
         .init();
 
-    // Parse prediction mode
+    // Parse prediction mode (mosh errors out on unrecognized values).
     let predict_mode = match cli.predict.as_str() {
         "always" => PredictionMode::Always,
         "never" => PredictionMode::Never,
-        "adaptive" | _ => PredictionMode::Adaptive,
+        "adaptive" => PredictionMode::Adaptive,
+        "experimental" => PredictionMode::Experimental,
+        other => anyhow::bail!(
+            "Unknown prediction mode: {} (expected adaptive, always, never, or experimental)",
+            other
+        ),
     };
 
     // Get connection details either via SSH bootstrap or direct connection
@@ -199,18 +204,28 @@ async fn run_session(
     // Initialize prediction engine
     let mut predictor = prediction::PredictionEngine::new(predict_mode, width, height);
 
+    // Mosh: MOSH_PREDICTION_OVERWRITE=yes selects overwrite predictions.
+    if std::env::var("MOSH_PREDICTION_OVERWRITE").as_deref() == Ok("yes") {
+        predictor.set_predict_overwrite(true);
+    }
+
     // Send initial resize to server
     transport.push_resize(width as i32, height as i32);
 
     // Guard to ensure cleanup on exit
     let _cleanup = CleanupGuard;
 
-    notification.set_message("mosh: Connecting...");
+    // Mosh: "Nothing received from server on UDP port %s."
+    let connecting_notification = format!(
+        "mosh: Nothing received from server on UDP port {}.",
+        remote_addr.port()
+    );
 
     // Main event loop
     let render_interval = Duration::from_millis(16); // ~60fps max
     let mut last_render = std::time::Instant::now();
     let mut command_pending = false;
+    let mut connect_timeout_reported = false;
 
     loop {
         // 1. Try to receive from network and update modeled remote state queue.
@@ -219,24 +234,46 @@ async fn run_session(
             latest_remote_fb = transport.latest_remote_framebuffer().clone();
             notification.clear();
         }
-        if let Some(reason) = transport.remote_close_reason() {
-            let _ = renderer::Renderer::cleanup();
-            eprintln!("\nmosh: {}", reason);
-            return Ok(());
-        }
         predictor.set_local_frame_acked(transport.acked_state_num());
         predictor.set_send_interval(transport.send_interval_ms());
         predictor.set_local_frame_late_acked(transport.latest_remote_echo_ack());
         predictor.cull(&latest_remote_fb);
 
-        // Update connection status notification
-        if transport.time_since_last_recv() > Duration::from_secs(15) {
+        // Surface non-fatal network errors (mosh set_network_error keeps
+        // the session alive and shows the error in the bar).
+        if let Some(err) = transport.take_socket_error() {
+            notification.set_message(&format!("mosh: {}", err));
+        }
+
+        // Connection status notification, 1:1 with mosh thresholds:
+        // server_late = 6.5s since last accepted state, reply_late = 10s
+        // since last acknowledged sent state, connect timeout = 15s.
+        let since_state = transport.latest_remote_state_age();
+        let since_ack = transport.sent_state_acked_age();
+        let server_late = since_state > Duration::from_millis(6500);
+        let reply_late = since_ack > Duration::from_millis(10_000);
+        if !transport.has_received_data() && !transport.shutdown_in_progress() {
+            if since_state > Duration::from_secs(15) {
+                if !connect_timeout_reported {
+                    connect_timeout_reported = true;
+                    notification.set_message("mosh: Timed out waiting for server...");
+                    transport.start_shutdown();
+                }
+            } else if since_state > Duration::from_millis(250) {
+                notification.set_message(&connecting_notification);
+            }
+        } else if server_late || reply_late {
+            // Prefer "last contact" unless the problem is uplink-only.
+            let (explanation, elapsed) = if reply_late && !server_late {
+                ("reply", since_ack)
+            } else {
+                ("contact", since_state)
+            };
             notification.set_message(&format!(
-                "mosh: Last contact {:.0}s ago",
-                transport.time_since_last_recv().as_secs_f64()
+                "mosh: Last {} {} ago.",
+                explanation,
+                human_readable_duration(elapsed.as_secs())
             ));
-        } else if !transport.has_received_data() {
-            notification.set_message("mosh: Connecting...");
         }
 
         // Maintain the same local modeled framebuffer that upstream mosh uses
@@ -381,6 +418,22 @@ async fn run_session(
             _ = transport.readable() => {},
             _ = tokio::time::sleep(Duration::from_millis(3)) => {},
         }
+    }
+}
+
+/// 1:1 with mosh's human_readable_duration: "N seconds", "M:SS", "H:MM:SS".
+fn human_readable_duration(num_seconds: u64) -> String {
+    if num_seconds < 60 {
+        format!("{} seconds", num_seconds)
+    } else if num_seconds < 3600 {
+        format!("{}:{:02}", num_seconds / 60, num_seconds % 60)
+    } else {
+        format!(
+            "{}:{:02}:{:02}",
+            num_seconds / 3600,
+            (num_seconds / 60) % 60,
+            num_seconds % 60
+        )
     }
 }
 

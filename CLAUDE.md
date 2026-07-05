@@ -11,7 +11,7 @@ MoshWin is a native Windows Mosh (Mobile Shell) client written in Rust. It imple
 ```bash
 cargo build                          # Debug build
 cargo build --release                # Release build
-cargo test                           # Run all 44 unit tests
+cargo test                           # Run all 57 unit tests
 cargo test <module>::tests::<name>   # Run a single test, e.g. cargo test crypto::tests::encrypt_decrypt_roundtrip
 cargo fmt                            # Format code
 cargo fmt -- --check                 # Check formatting without modifying
@@ -51,11 +51,13 @@ Run the client: `cargo run -- [user@]host` (requires a mosh-server on the remote
 
 ### Protocol details
 
-- **Wire format:** AES-128-OCB encrypted UDP, 8-byte nonce + 16-byte OCB tag (24 bytes overhead)
+- **Wire format:** AES-128-OCB encrypted UDP, 8-byte nonce + 16-byte OCB tag (24 bytes overhead); received packets are checked for direction bit and replay (`expected_receiver_seq`), like upstream
 - **Serialization:** Protobuf via `prost` with inline message definitions (no `.proto` files / no protoc needed)
-- **Fragmentation:** MTU 1280 bytes; large states split into numbered fragments and reassembled
+- **Fragmentation:** 1280-byte IP-packet budget like upstream (per-fragment payload 1214 bytes on IPv4, 1178 on IPv6); large states split into numbered fragments and reassembled
 - **Compression:** Optional zlib (flate2) for state diffs
 - **Mosh protocol version:** 2 (upstream compatible)
+- **RTT estimation:** SRTT/RTTVAR start at 1000/500 ms until the first sample; samples ≥ 5 s ignored; received timestamps are echoed at most once, corrected for hold time (upstream `saved_timestamp` semantics)
+- **Roaming:** client hops to a new source port after 10 s without roundtrip success (old sockets kept for receive, pruned like upstream)
 
 ### Timing constants (in transport.rs)
 

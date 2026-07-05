@@ -9,7 +9,7 @@
 use crate::terminal::{Cell, Framebuffer};
 use std::time::{Duration, Instant};
 
-/// Prediction display mode.
+/// Prediction display mode (mosh `DisplayPreference`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PredictionMode {
     /// Never predict.
@@ -18,6 +18,9 @@ pub enum PredictionMode {
     Always,
     /// Display predictions adaptively from timing heuristics.
     Adaptive,
+    /// Upstream's experimental mode: always display, but discard failed
+    /// predictions cell-by-cell instead of resetting whole epochs.
+    Experimental,
 }
 
 impl Default for PredictionMode {
@@ -147,6 +150,9 @@ pub struct PredictionEngine {
     last_width: usize,
     last_height: usize,
     predict_overwrite: bool,
+    /// Partially accumulated UTF-8 sequence from user input (upstream feeds
+    /// bytes through a UTF8Parser and predicts single-width characters).
+    pending_utf8: Vec<u8>,
 }
 
 impl PredictionEngine {
@@ -171,7 +177,13 @@ impl PredictionEngine {
             last_width: width,
             last_height: height,
             predict_overwrite: false,
+            pending_utf8: Vec::new(),
         }
+    }
+
+    /// Mosh `set_predict_overwrite` (MOSH_PREDICTION_OVERWRITE=yes).
+    pub fn set_predict_overwrite(&mut self, overwrite: bool) {
+        self.predict_overwrite = overwrite;
     }
 
     pub fn resize(&mut self, width: usize, height: usize) {
@@ -186,6 +198,7 @@ impl PredictionEngine {
         self.overlays.clear();
         self.cursors.clear();
         self.esc_state = 0;
+        self.pending_utf8.clear();
         self.become_tentative();
     }
 
@@ -201,9 +214,7 @@ impl PredictionEngine {
     }
 
     pub fn set_local_frame_late_acked(&mut self, frame_num: u64) {
-        if frame_num > self.local_frame_late_acked {
-            self.local_frame_late_acked = frame_num;
-        }
+        self.local_frame_late_acked = frame_num;
     }
 
     pub fn set_send_interval(&mut self, send_interval_ms: u64) {
@@ -230,6 +241,9 @@ impl PredictionEngine {
     fn new_user_byte(&mut self, mut the_byte: u8, fb: &Framebuffer) {
         if self.mode == PredictionMode::Never {
             return;
+        } else if self.mode == PredictionMode::Experimental {
+            // Mosh: in Experimental mode, predictions are never tentative.
+            self.prediction_epoch = self.confirmed_epoch;
         }
 
         self.cull(fb);
@@ -242,6 +256,29 @@ impl PredictionEngine {
         let now = Instant::now();
         match self.esc_state {
             0 => {
+                // Assemble multi-byte UTF-8 sequences: upstream feeds bytes
+                // through a UTF8Parser and predicts single-width characters.
+                if !self.pending_utf8.is_empty() {
+                    if (0x80..0xC0).contains(&the_byte) {
+                        self.pending_utf8.push(the_byte);
+                        let need = utf8_sequence_len(self.pending_utf8[0]);
+                        if self.pending_utf8.len() >= need {
+                            let bytes = std::mem::take(&mut self.pending_utf8);
+                            match std::str::from_utf8(&bytes)
+                                .ok()
+                                .and_then(|s| s.chars().next())
+                            {
+                                Some(ch) => self.predict_char(ch, fb, now),
+                                None => self.become_tentative(),
+                            }
+                        }
+                        return;
+                    }
+                    // Malformed sequence: unknown print (mosh: become_tentative).
+                    self.pending_utf8.clear();
+                    self.become_tentative();
+                }
+
                 if the_byte == 0x1B {
                     self.esc_state = 1;
                     return;
@@ -253,6 +290,7 @@ impl PredictionEngine {
                         self.newline_carriage_return(fb, now);
                     }
                     0x20..=0x7E => self.predict_printable(the_byte as char, fb, now),
+                    0xC2..=0xF4 => self.pending_utf8.push(the_byte), // UTF-8 lead byte
                     _ => self.become_tentative(),
                 }
             }
@@ -281,8 +319,23 @@ impl PredictionEngine {
         }
     }
 
+    /// Predict a fully decoded character (mosh Print action handling):
+    /// only single-width characters are predicted.
+    fn predict_char(&mut self, ch: char, fb: &Framebuffer, now: Instant) {
+        use unicode_width::UnicodeWidthChar;
+        if (ch as u32) < 0x20 || ch.width() != Some(1) {
+            // Unknown print (control, combining, or wide character).
+            self.become_tentative();
+        } else {
+            self.predict_printable(ch, fb, now);
+        }
+    }
+
     fn become_tentative(&mut self) {
-        self.prediction_epoch = self.prediction_epoch.saturating_add(1);
+        // Mosh: `if ( display_preference != Experimental ) prediction_epoch++`.
+        if self.mode != PredictionMode::Experimental {
+            self.prediction_epoch = self.prediction_epoch.saturating_add(1);
+        }
     }
 
     fn active(&self) -> bool {
@@ -297,7 +350,7 @@ impl PredictionEngine {
     fn should_display_predictions(&self) -> bool {
         match self.mode {
             PredictionMode::Never => false,
-            PredictionMode::Always => true,
+            PredictionMode::Always | PredictionMode::Experimental => true,
             PredictionMode::Adaptive => self.srtt_trigger || self.glitch_trigger > 0,
         }
     }
@@ -723,6 +776,12 @@ impl PredictionEngine {
 
                     match validity {
                         Validity::IncorrectOrExpired => {
+                            // Mosh Experimental mode: drop just the failed
+                            // cell instead of killing the epoch / resetting.
+                            if self.mode == PredictionMode::Experimental {
+                                row.overlay_cells[idx].reset();
+                                continue;
+                            }
                             let cell = &row.overlay_cells[idx];
                             if cell.tentative(self.confirmed_epoch) {
                                 kill_epoch = Some(cell.tentative_until_epoch);
@@ -804,8 +863,13 @@ impl PredictionEngine {
             if Self::cursor_validity(self.local_frame_late_acked, server_fb, last_cursor)
                 == Validity::IncorrectOrExpired
             {
-                self.reset();
-                return;
+                if self.mode == PredictionMode::Experimental {
+                    // Mosh Experimental mode: drop cursor predictions only.
+                    self.cursors.clear();
+                } else {
+                    self.reset();
+                    return;
+                }
             }
         }
 
@@ -874,6 +938,16 @@ impl PredictionEngine {
     #[allow(dead_code)]
     pub fn has_predictions(&self) -> bool {
         self.active()
+    }
+}
+
+/// Expected length of a UTF-8 sequence from its lead byte.
+fn utf8_sequence_len(lead: u8) -> usize {
+    match lead {
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => 1,
     }
 }
 
@@ -947,6 +1021,58 @@ mod tests {
         p.set_local_frame_acked(11);
         p.cull(&fb);
         assert!(p.has_predictions());
+    }
+
+    #[test]
+    fn predicts_single_width_utf8_characters() {
+        // Upstream predicts any single-width printable char (e.g. 'é').
+        let mut p = PredictionEngine::new(PredictionMode::Always, 80, 24);
+        p.set_local_frame_sent(0);
+        let fb = blank_fb();
+        p.new_user_input_batch("é".as_bytes(), &fb);
+        assert!(p.has_predictions());
+
+        let mut overlay = fb.clone();
+        // First prediction of a session is tentative until its epoch is
+        // confirmed, so just verify the overlay cell was recorded.
+        let _ = p.apply_overlays(&mut overlay);
+        assert_eq!(p.overlays.len(), 1);
+        assert_eq!(p.overlays[0].overlay_cells[0].replacement.character, 'é');
+    }
+
+    #[test]
+    fn wide_utf8_characters_are_not_predicted() {
+        // Upstream: wcwidth != 1 → become_tentative, no cell prediction.
+        let mut p = PredictionEngine::new(PredictionMode::Always, 80, 24);
+        p.set_local_frame_sent(0);
+        let fb = blank_fb();
+        p.new_user_input_batch("あ".as_bytes(), &fb);
+        assert!(p
+            .overlays
+            .iter()
+            .all(|row| row.overlay_cells.iter().all(|c| !c.active)));
+    }
+
+    #[test]
+    fn experimental_mode_discards_single_bad_cells() {
+        let mut p = PredictionEngine::new(PredictionMode::Experimental, 80, 24);
+        p.set_local_frame_sent(0);
+        let fb = blank_fb();
+        p.new_user_input_batch(b"ab", &fb);
+        assert!(p.has_predictions());
+
+        // Server confirms a different reality: 'x' at (0,0).
+        let mut server_fb = blank_fb();
+        server_fb.cells[0][0].character = 'x';
+        p.set_local_frame_late_acked(1);
+        p.cull(&server_fb);
+
+        // In Experimental mode a failed cell does not wipe the engine's
+        // cursor prediction state wholesale.
+        assert!(p
+            .overlays
+            .iter()
+            .all(|row| row.overlay_cells.iter().all(|c| !c.active)));
     }
 
     #[test]

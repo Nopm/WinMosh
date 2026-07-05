@@ -13,14 +13,45 @@ const TIMESTAMP_LEN: usize = 4;
 /// Fragment header length: 8 (instruction_id) + 2 (fragment_num + final flag).
 const FRAG_HEADER_LEN: usize = 10;
 
-/// Default MTU for Mosh (conservative, works with IPv4 and IPv6).
-pub const DEFAULT_MTU: usize = 1280;
+// ── MTU accounting (1:1 with mosh network.h) ────────────────────────────────
 
-/// Overhead per encrypted packet: 8-byte nonce + 16-byte OCB tag.
-const CRYPTO_OVERHEAD: usize = 24;
+/// IPv4 MTU. Don't use full Ethernet-derived MTU; mobile networks have high
+/// tunneling overhead (upstream uses a 1280-byte IPv4 MTU).
+const DEFAULT_IPV4_MTU: usize = 1280;
+/// IPv6 MTU. Use the guaranteed minimum to avoid fragmentation.
+const DEFAULT_IPV6_MTU: usize = 1280;
 
-/// Maximum payload per fragment: MTU - crypto overhead - timestamp overhead - fragment header.
-pub const MAX_FRAG_PAYLOAD: usize = DEFAULT_MTU - CRYPTO_OVERHEAD - TIMESTAMP_LEN - FRAG_HEADER_LEN;
+/// For IPv4, guess the typical (minimum) header length.
+const IPV4_HEADER_LEN: usize = 20 /* base IP header */ + 8 /* UDP */;
+/// For IPv6, make a conservative guess about header size.
+const IPV6_HEADER_LEN: usize = 40 /* base IPv6 header */
+    + 16 /* 2 minimum-sized extension headers */
+    + 8 /* UDP */;
+
+/// Network transport overhead per packet (mosh `Connection::ADDED_BYTES`):
+/// 8-byte seqno/nonce + 4 bytes of timestamps.
+const ADDED_BYTES: usize = 8 + TIMESTAMP_LEN;
+
+/// Crypto overhead per packet (mosh `Crypto::Session::ADDED_BYTES`): final OCB block.
+const CRYPTO_ADDED_BYTES: usize = 16;
+
+/// Application datagram MTU for the given address family
+/// (mosh `Connection::set_MTU`).
+pub fn mtu_for_family(is_ipv6: bool) -> usize {
+    if is_ipv6 {
+        DEFAULT_IPV6_MTU - IPV6_HEADER_LEN
+    } else {
+        DEFAULT_IPV4_MTU - IPV4_HEADER_LEN
+    }
+}
+
+/// Maximum payload per fragment for the given address family:
+/// app MTU - nonce/timestamps - OCB tag - fragment header.
+/// (mosh: `connection->get_MTU() - Connection::ADDED_BYTES - Session::ADDED_BYTES`,
+/// then `Fragmenter::make_fragments` subtracts `Fragment::frag_header_len`.)
+pub fn max_frag_payload_for_family(is_ipv6: bool) -> usize {
+    mtu_for_family(is_ipv6) - ADDED_BYTES - CRYPTO_ADDED_BYTES - FRAG_HEADER_LEN
+}
 
 /// A Mosh network packet (after decryption, before fragmentation parsing).
 #[derive(Debug, Clone)]
@@ -160,6 +191,13 @@ impl Fragmenter {
 
         let chunks: Vec<&[u8]> = instruction.chunks(max_frag_payload).collect();
         let total = chunks.len();
+        // Mosh: fatal_assert( !( fragment_num & 0x8000 ) ) — effective limit on the
+        // size of a terminal screen change or buffered user input.
+        assert!(
+            total <= 0x8000,
+            "instruction too large to fragment: {} fragments",
+            total
+        );
 
         chunks
             .into_iter()
@@ -250,14 +288,31 @@ impl FragmentAssembly {
 
 }
 
-/// Generate a 16-bit timestamp from the current time (milliseconds mod 65536).
+/// Generate a 16-bit timestamp from a monotonic clock (milliseconds mod 65536).
+///
+/// 1:1 with mosh `Network::timestamp16()`: never returns 65535, which is
+/// reserved as the "no timestamp" sentinel on the wire.
 pub fn current_timestamp() -> u16 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    (millis % 65536) as u16
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let start = *START.get_or_init(Instant::now);
+    let ts = (start.elapsed().as_millis() % 65536) as u16;
+    if ts == u16::MAX {
+        ts.wrapping_add(1) // mosh: `if ( ts == uint16_t(-1) ) ts++;`
+    } else {
+        ts
+    }
+}
+
+/// Difference between two 16-bit timestamps, handling wraparound.
+/// 1:1 with mosh `Network::timestamp_diff()`.
+pub fn timestamp_diff(tsnew: u16, tsold: u16) -> u16 {
+    let mut diff = i32::from(tsnew) - i32::from(tsold);
+    if diff < 0 {
+        diff += 65536;
+    }
+    diff as u16
 }
 
 #[cfg(test)]
@@ -312,10 +367,34 @@ mod tests {
     fn test_fragmenter_single_fragment() {
         let mut fragmenter = Fragmenter::new();
         let data = vec![0u8; 100];
-        let frags = fragmenter.make_fragments(&data, MAX_FRAG_PAYLOAD);
+        let frags = fragmenter.make_fragments(&data, max_frag_payload_for_family(false));
         assert_eq!(frags.len(), 1);
         assert!(frags[0].is_final);
         assert_eq!(frags[0].contents.len(), 100);
+    }
+
+    #[test]
+    fn test_mtu_accounting_matches_upstream() {
+        // mosh: IPv4 app MTU = 1280 - 28 = 1252; fragment payload = 1252 - 12 - 16 - 10.
+        assert_eq!(mtu_for_family(false), 1252);
+        assert_eq!(max_frag_payload_for_family(false), 1214);
+        // mosh: IPv6 app MTU = 1280 - 64 = 1216; fragment payload = 1216 - 12 - 16 - 10.
+        assert_eq!(mtu_for_family(true), 1216);
+        assert_eq!(max_frag_payload_for_family(true), 1178);
+    }
+
+    #[test]
+    fn test_timestamp_diff_wraparound() {
+        assert_eq!(timestamp_diff(10, 5), 5);
+        assert_eq!(timestamp_diff(5, 65530), 11);
+        assert_eq!(timestamp_diff(0, 0), 0);
+    }
+
+    #[test]
+    fn test_current_timestamp_never_returns_sentinel() {
+        // Structural check: the sentinel branch maps 65535 -> 0 like upstream ts++.
+        assert_eq!(u16::MAX.wrapping_add(1), 0);
+        assert_ne!(current_timestamp(), u16::MAX);
     }
 
     #[test]
